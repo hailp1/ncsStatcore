@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Lê"
+  given-names: "Phúc Hải"
+  orcid: https://orcid.org/0009-0004-1215-5023
+title: "ncsStat: A Serverless, WebAssembly-Based Platform for Psychometric Analysis"
+version: 1.0.0
+date-released: 2026-01-18
+url: https://github.com/hailp1/ncsstat

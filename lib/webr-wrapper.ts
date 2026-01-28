@@ -1,0 +1,1315 @@
+// WebR Wrapper for R Statistical Analysis
+import { WebR } from 'webr';
+
+let webRInstance: WebR | null = null;
+let isInitializing = false;
+let initPromise: Promise<WebR> | null = null;
+let initProgress: string = '';
+let onProgressCallback: ((msg: string) => void) | null = null;
+
+// Get current WebR loading status
+export function getWebRStatus(): { isReady: boolean; isLoading: boolean; progress: string } {
+    return {
+        isReady: webRInstance !== null,
+        isLoading: isInitializing,
+        progress: initProgress
+    };
+}
+
+// Set callback for progress updates
+export function setProgressCallback(callback: (msg: string) => void) {
+    onProgressCallback = callback;
+}
+
+function updateProgress(msg: string) {
+    initProgress = msg;
+    if (onProgressCallback) onProgressCallback(msg);
+}
+
+/**
+ * Initialize WebR instance (singleton with promise caching and retry logic)
+ */
+export async function initWebR(maxRetries: number = 3): Promise<WebR> {
+    // Return existing instance
+    if (webRInstance) {
+        try {
+            if (typeof webRInstance.evalR === 'function') {
+                return webRInstance;
+            }
+        } catch (e) {
+            console.warn('WebR instance exists but is not usable, reinitializing...');
+            webRInstance = null;
+        }
+    }
+
+    // Return existing promise if init in progress
+    if (initPromise) {
+        return initPromise;
+    }
+
+    if (isInitializing) {
+        // Wait for initialization to complete
+        let attempts = 0;
+        while (isInitializing && attempts < 100) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            attempts++;
+        }
+        if (webRInstance) {
+            return webRInstance;
+        }
+        throw new Error('WebR initialization timeout');
+    }
+
+    isInitializing = true;
+    updateProgress('Đang khởi tạo WebR...');
+
+    // Retry logic wrapper
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        initPromise = (async () => {
+            try {
+                const webR = new WebR({
+                    channelType: 1, // PostMessage channel
+                });
+
+                updateProgress('Đang tải R runtime...');
+                await webR.init();
+
+                // Verify initialization
+                if (!webR.evalR) {
+                    throw new Error('WebR initialized but evalR is not available');
+                }
+
+                // Install required packages
+                updateProgress('Đang cài đặt packages (psych, lavaan)...');
+                try {
+                    await webR.installPackages(['psych', 'lavaan', 'corrplot', 'GPArotation']);
+
+                    // Load packages in parallel for faster init
+                    updateProgress('Đang load packages...');
+                    await Promise.all([
+                        webR.evalR('library(psych)'),
+                        webR.evalR('library(lavaan)'),
+                        webR.evalR('library(GPArotation)')
+                    ]);
+                } catch (pkgError) {
+                    console.warn('Package installation failed, continuing anyway:', pkgError);
+                }
+
+                updateProgress('Sẵn sàng!');
+                webRInstance = webR;
+                isInitializing = false;
+                initPromise = null;
+                return webR;
+            } catch (error) {
+                // If not last attempt, retry
+                if (attempt < maxRetries - 1) {
+                    console.warn(`WebR init attempt ${attempt + 1} failed, retrying...`);
+                    updateProgress(`Thử lại lần ${attempt + 2}...`);
+                    await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+                    throw error; // Throw to trigger retry
+                }
+
+                // Last attempt failed
+                isInitializing = false;
+                webRInstance = null;
+                initPromise = null;
+                updateProgress('Lỗi khởi tạo!');
+                console.error('WebR initialization error:', error);
+                throw new Error(`Failed to initialize WebR after ${maxRetries} attempts: ${error}`);
+            }
+        })();
+
+        try {
+            return await initPromise;
+        } catch (error) {
+            if (attempt === maxRetries - 1) {
+                throw error;
+            }
+            // Continue to next retry
+        }
+    }
+
+    throw new Error('WebR initialization failed');
+}
+/**
+ * Helper to parse WebR evaluation result (list) into a getter function
+ */
+export function parseWebRResult(jsResult: any) {
+    return (name: string): any => {
+        if (!jsResult.names || !jsResult.values) return null;
+        const idx = jsResult.names.indexOf(name);
+        if (idx === -1) return null;
+        const item = jsResult.values[idx];
+        // Handle nested structure: WebR objects often have {type: ..., values: ...}
+        if (item && item.values) return item.values;
+        return item;
+    };
+}
+
+/**
+ * Convert JS array to R matrix string
+ */
+function arrayToRMatrix(data: number[][]): string {
+    const flat = data.flat();
+    return `matrix(c(${flat.join(',')}), nrow=${data.length}, byrow=TRUE)`;
+}
+
+/**
+ * Parse flat array to matrix (for internal use)
+ */
+function parseMatrix(val: any, dim: number): number[][] {
+    if (!val || !Array.isArray(val)) return [];
+    const matrix: number[][] = [];
+    for (let i = 0; i < dim; i++) {
+        matrix.push(val.slice(i * dim, (i + 1) * dim));
+    }
+    return matrix;
+}
+
+/**
+ * Run Cronbach's Alpha analysis with SPSS-style Item-Total Statistics
+ */
+export async function runCronbachAlpha(data: number[][]): Promise<{
+    alpha: number;
+    rawAlpha: number;
+    standardizedAlpha: number;
+    nItems: number | string;
+    itemTotalStats: {
+        itemName: string;
+        scaleMeanIfDeleted: number;
+        scaleVarianceIfDeleted: number;
+        correctedItemTotalCorrelation: number;
+        alphaIfItemDeleted: number;
+    }[];
+    rCode: string;
+}> {
+    const webR = await initWebR();
+
+    const rCode = `
+    library(psych)
+    data <- ${arrayToRMatrix(data)}
+    result <- alpha(data)
+    
+    # Extract item-total statistics
+    item_stats <- result$item.stats
+    alpha_drop <- result$alpha.drop
+    
+    list(
+      raw_alpha = result$total$raw_alpha,
+      std_alpha = result$total$std.alpha,
+      n_items = ncol(data),
+      # Item-total statistics
+      scale_mean_deleted = alpha_drop$mean,
+      scale_var_deleted = alpha_drop$sd^2,
+      corrected_item_total = item_stats$r.drop,
+      alpha_if_deleted = alpha_drop$raw_alpha
+    )
+  `;
+
+    const result = await webR.evalR(rCode);
+    const jsResult = await result.toJs() as any;
+
+
+
+    // WebR list parsing helper
+    const getValue = parseWebRResult(jsResult);
+
+    const rawAlpha = getValue('raw_alpha')?.[0] || 0;
+    const stdAlpha = getValue('std_alpha')?.[0] || 0;
+    const nItems = getValue('n_items')?.[0] || 'N/A';
+
+    // Parse item-total statistics
+    const scaleMeanDeleted = getValue('scale_mean_deleted') || [];
+    const scaleVarDeleted = getValue('scale_var_deleted') || [];
+    const correctedItemTotal = getValue('corrected_item_total') || [];
+    const alphaIfDeleted = getValue('alpha_if_deleted') || [];
+
+    const itemCount = typeof nItems === 'number' ? nItems : Number(nItems) || 0;
+    const itemTotalStats = [];
+
+    for (let i = 0; i < itemCount; i++) {
+        itemTotalStats.push({
+            itemName: `VAR${(i + 1).toString().padStart(2, '0')}`,
+            scaleMeanIfDeleted: scaleMeanDeleted[i] || 0,
+            scaleVarianceIfDeleted: scaleVarDeleted[i] || 0,
+            correctedItemTotalCorrelation: correctedItemTotal[i] || 0,
+            alphaIfItemDeleted: alphaIfDeleted[i] || 0
+        });
+    }
+
+
+
+    return {
+        alpha: rawAlpha,
+        rawAlpha: rawAlpha,
+        standardizedAlpha: stdAlpha,
+        nItems: itemCount,
+        itemTotalStats: itemTotalStats,
+        rCode: rCode
+    };
+}
+
+
+
+/**
+ * Run correlation analysis
+ */
+export async function runCorrelation(data: number[][]): Promise<{
+    correlationMatrix: number[][];
+    pValues: number[][];
+    rCode: string;
+}> {
+    const webR = await initWebR();
+
+    const nCols = data[0]?.length || 0;
+
+    const rCode = `
+    data <- ${arrayToRMatrix(data)}
+    
+    # Use base R cor() function - simpler and no row name issues
+    n <- nrow(data)
+    ncols <- ncol(data)
+    
+    # Correlation matrix
+    corr_matrix <- cor(data, use="pairwise.complete.obs")
+    
+    # Calculate p-values manually using t-test formula
+    p_matrix <- matrix(0, ncols, ncols)
+    for (i in 1:ncols) {
+      for (j in 1:ncols) {
+        if (i == j) {
+          p_matrix[i,j] <- 0
+        } else {
+          r <- corr_matrix[i,j]
+          t_stat <- r * sqrt((n-2)/(1-r^2))
+          p_matrix[i,j] <- 2 * pt(-abs(t_stat), df=n-2)
+        }
+      }
+    }
+    
+    list(
+      correlation = as.vector(corr_matrix),
+      p_values = as.vector(p_matrix),
+      n_cols = ncols
+    )
+  `;
+
+    const result = await webR.evalR(rCode);
+    const jsResult = await result.toJs() as any;
+
+
+
+    const getValue = parseWebRResult(jsResult);
+
+    const numCols = getValue('n_cols')?.[0] || nCols;
+
+    return {
+        correlationMatrix: parseMatrix(getValue('correlation'), numCols),
+        pValues: parseMatrix(getValue('p_values'), numCols),
+        rCode: rCode
+    };
+}
+
+/**
+ * Run descriptive statistics
+ */
+
+function toArray(val: any): number[] {
+    if (!val) return [];
+    // WebR often returns {values: [...]} structure
+    if (typeof val === 'object' && val.values && Array.isArray(val.values)) {
+        return val.values;
+    }
+    if (Array.isArray(val)) return val;
+    if (typeof val === 'object' && 'length' in val) return Array.from(val);
+    if (typeof val === 'object') {
+        const values = Object.values(val);
+        // If values are numbers, return them
+        if (values.every(v => typeof v === 'number')) {
+            return values as number[];
+        }
+        // If values are objects with 'values' property
+        if (values.length > 0 && typeof values[0] === 'object') {
+            return values.map((v: any) => v?.values?.[0] ?? v ?? 0) as number[];
+        }
+        return values as number[];
+    }
+    return [Number(val)];
+}
+
+/**
+ * Run descriptive statistics
+ */
+export async function runDescriptiveStats(data: number[][]): Promise<{
+    mean: number[];
+    sd: number[];
+    min: number[];
+    max: number[];
+    median: number[];
+    N: number;
+}> {
+    const webR = await initWebR();
+
+    const rCode = `
+    data <- ${arrayToRMatrix(data)}
+    
+    list(
+      mean = colMeans(data, na.rm=TRUE),
+      sd = apply(data, 2, sd, na.rm=TRUE),
+      min = apply(data, 2, min, na.rm=TRUE),
+      max = apply(data, 2, max, na.rm=TRUE),
+      median = apply(data, 2, median, na.rm=TRUE),
+      n = nrow(data)
+    )
+  `;
+
+    const result = await webR.evalR(rCode);
+    const jsResult = await result.toJs() as any;
+
+
+
+    // WebR returns {type:'list', names:[...], values:[{type:'double', values:[...]}, ...]}
+    // We need to extract values by index based on names array
+    const getValue = parseWebRResult(jsResult);
+
+    const processed = {
+        mean: getValue('mean') || [],
+        sd: getValue('sd') || [],
+        min: getValue('min') || [],
+        max: getValue('max') || [],
+        median: getValue('median') || [],
+        N: (Array.isArray(getValue('n')) ? getValue('n')[0] : getValue('n')) || 0
+    };
+
+
+
+    return processed;
+}
+
+/**
+ * Run Independent Samples T-test
+ */
+export async function runTTestIndependent(group1: number[], group2: number[]): Promise<{
+    t: number;
+    df: number;
+    pValue: number;
+    mean1: number;
+    mean2: number;
+    meanDiff: number;
+    ci95Lower: number;
+    ci95Upper: number;
+    effectSize: number; // Cohen's d
+    rCode: string;
+}> {
+    const webR = await initWebR();
+
+    const rCode = `
+    group1 <- c(${group1.join(',')})
+    group2 <- c(${group2.join(',')})
+    
+    result <- t.test(group1, group2, var.equal = FALSE)
+    
+    # Cohen's d effect size
+    pooledSD <- sqrt(((length(group1)-1)*sd(group1)^2 + (length(group2)-1)*sd(group2)^2) / (length(group1)+length(group2)-2))
+    cohensD <- (mean(group1) - mean(group2)) / pooledSD
+    
+    list(
+      t = result$statistic,
+      df = result$parameter,
+      pValue = result$p.value,
+      mean1 = mean(group1),
+      mean2 = mean(group2),
+      meanDiff = mean(group1) - mean(group2),
+      ci95Lower = result$conf.int[1],
+      ci95Upper = result$conf.int[2],
+      effectSize = cohensD
+    )
+    `;
+
+    const result = await webR.evalR(rCode);
+    const jsResult = await result.toJs() as any;
+
+    const getValueFunc = parseWebRResult(jsResult);
+    const getValue = (name: string): number => {
+        const val = getValueFunc(name);
+        if (val === null || val === undefined) return 0;
+        if (Array.isArray(val) && val.length > 0) return Number(val[0]) || 0;
+        return Number(val) || 0;
+    };
+
+    return {
+        t: getValue('t'),
+        df: getValue('df'),
+        pValue: getValue('pValue'),
+        mean1: getValue('mean1'),
+        mean2: getValue('mean2'),
+        meanDiff: getValue('meanDiff'),
+        ci95Lower: getValue('ci95Lower'),
+        ci95Upper: getValue('ci95Upper'),
+        effectSize: getValue('effectSize'),
+        rCode: rCode
+    };
+}
+
+/**
+ * Run Paired Samples T-test
+ */
+export async function runTTestPaired(before: number[], after: number[]): Promise<{
+    t: number;
+    df: number;
+    pValue: number;
+    meanBefore: number;
+    meanAfter: number;
+    meanDiff: number;
+    ci95Lower: number;
+    ci95Upper: number;
+    rCode: string;
+}> {
+    const webR = await initWebR();
+
+    const rCode = `
+    before <- c(${before.join(',')})
+    after <- c(${after.join(',')})
+
+    result <- t.test(before, after, paired = TRUE)
+
+    list(
+        t = result$statistic,
+        df = result$parameter,
+        pValue = result$p.value,
+        meanBefore = mean(before),
+        meanAfter = mean(after),
+        meanDiff = mean(before - after),
+        ci95Lower = result$conf.int[1],
+        ci95Upper = result$conf.int[2]
+    )
+  `;
+
+    const result = await webR.evalR(rCode);
+    const jsResult = await result.toJs() as any;
+
+    const getValueFunc = parseWebRResult(jsResult);
+    const getValue = (name: string): number => {
+        const val = getValueFunc(name);
+        if (val === null || val === undefined) return 0;
+        if (Array.isArray(val) && val.length > 0) return Number(val[0]) || 0;
+        return Number(val) || 0;
+    };
+
+    return {
+        t: getValue('t'),
+        df: getValue('df'),
+        pValue: getValue('pValue'),
+        meanBefore: getValue('meanBefore'),
+        meanAfter: getValue('meanAfter'),
+        meanDiff: getValue('meanDiff'),
+        ci95Lower: getValue('ci95Lower'),
+        ci95Upper: getValue('ci95Upper'),
+        rCode: rCode
+    };
+}
+
+/**
+ * Run One-Way ANOVA
+ */
+export async function runOneWayANOVA(groups: number[][]): Promise<{
+    F: number;
+    dfBetween: number;
+    dfWithin: number;
+    pValue: number;
+    groupMeans: number[];
+    grandMean: number;
+    etaSquared: number;
+    rCode: string;
+}> {
+    const webR = await initWebR();
+
+    // Build group data for R
+    const groupData = groups.map((g, i) =>
+        g.map(v => `c(${v}, ${i + 1})`).join(',')
+    ).join(',');
+
+    const rCode = `
+    # Create data frame with values and group labels
+values <- c(${groups.map(g => g.join(',')).join(',')})
+groups <- factor(c(${groups.map((g, i) => g.map(() => i + 1).join(',')).join(',')}))
+    
+    # Run ANOVA
+model <- aov(values ~groups)
+result <- summary(model)[[1]]
+    
+    # Calculate eta squared
+ssb <- result[1, 2]  # Sum of squares between
+sst <- ssb + result[2, 2]  # Total sum of squares
+etaSquared <- ssb / sst
+    
+    # Group means
+groupMeans <- tapply(values, groups, mean)
+
+list(
+    F = result[1, 4],
+    dfBetween = result[1, 1],
+    dfWithin = result[2, 1],
+    pValue = result[1, 5],
+    groupMeans = as.numeric(groupMeans),
+    grandMean = mean(values),
+    etaSquared = etaSquared
+)
+    `;
+
+    const result = await webR.evalR(rCode);
+    const jsResult = await result.toJs() as any;
+
+    const getValue = parseWebRResult(jsResult);
+
+    return {
+        F: (Array.isArray(getValue('F')) ? getValue('F')[0] : getValue('F')) || 0,
+        dfBetween: (Array.isArray(getValue('dfBetween')) ? getValue('dfBetween')[0] : getValue('dfBetween')) || 0,
+        dfWithin: (Array.isArray(getValue('dfWithin')) ? getValue('dfWithin')[0] : getValue('dfWithin')) || 0,
+        pValue: (Array.isArray(getValue('pValue')) ? getValue('pValue')[0] : getValue('pValue')) || 0,
+        groupMeans: getValue('groupMeans') || [],
+        grandMean: (Array.isArray(getValue('grandMean')) ? getValue('grandMean')[0] : getValue('grandMean')) || 0,
+        etaSquared: (Array.isArray(getValue('etaSquared')) ? getValue('etaSquared')[0] : getValue('etaSquared')) || 0,
+        rCode
+    };
+}
+
+/**
+ * Run Exploratory Factor Analysis (EFA)
+ */
+export async function runEFA(data: number[][], nFactors: number): Promise<{
+    kmo: number;
+    bartlettP: number;
+    loadings: number[][];
+    communalities: number[];
+    structure: number[][];
+    rCode: string;
+}> {
+    const webR = await initWebR();
+
+    const rCode = `
+    # Load psych package for EFA
+    library(psych)
+
+    # Convert JS array of arrays to R matrix
+    data_mat <- matrix(c(${data.flat().join(',')}), nrow = ${data.length}, byrow = TRUE)
+    
+    # 0. Pre-clean: Replace infinite values with NA
+    data_mat[!is.finite(data_mat)] <- NA
+    
+    # 1. Filter out Zero Variance Columns
+    valid_cols <- apply(data_mat, 2, var, na.rm=TRUE) != 0
+    if (sum(valid_cols, na.rm=TRUE) < 2) {
+       stop("Analysis requires at least 2 variables with variation (non-constant).")
+    }
+    data_mat <- data_mat[, valid_cols]
+    
+    # 2. Calculate robust correlation matrix
+    cor_mat <- cor(data_mat, use = "pairwise.complete.obs")
+    cor_mat[is.na(cor_mat)] <- 0 
+    
+    # 3. KMO and Bartlett's Test
+    kmo_result <- tryCatch({ KMO(cor_mat) }, error = function(e) { list(MSA = c(0)) }) 
+    bartlett_result <- tryCatch({ cortest.bartlett(cor_mat, n = ${data.length}) }, error = function(e) { list(p.value = 1) })
+    
+    # 4. Determine Number of Factors
+    entered_factors <- ${nFactors}
+    
+    if (entered_factors <= 0) {
+        # Auto-detect using Kaiser Criterion (Eigenvalues > 1)
+        # We use the correlation matrix eigenvalues
+        ev <- eigen(cor_mat)$values
+        actual_factors <- sum(ev > 1)
+        # Safety net: must extract at least 1 factor
+        if (actual_factors < 1) actual_factors <- 1
+    } else {
+        # Use user input, capped by variable count
+        actual_factors <- min(entered_factors, ncol(data_mat) - 1)
+        if (actual_factors < 1) actual_factors <- 1
+    }
+
+    # 5. Perform EFA
+    # STRATEGY: Try "pa" (Principal Axis - like SPSS) first. 
+    # If it fails (due to singular matrix/SVD error), fallback to "minres" (Robust).
+
+    efa_result <- tryCatch({
+       fa(cor_mat, nfactors = actual_factors, n.obs = ${data.length}, rotate = "varimax", fm = "pa", warnings=FALSE)
+    }, error = function(e) {
+       # Fallback to MinRes if PA fails
+       fa(cor_mat, nfactors = actual_factors, n.obs = ${data.length}, rotate = "varimax", fm = "minres", warnings=FALSE)
+    })
+
+list(
+    kmo = kmo_result$MSA[1], # Overall MSA
+      bartlett_p = bartlett_result$p.value,
+    loadings = efa_result$loadings,
+    communalities = efa_result$communalities,
+    structure = efa_result$Structure
+)
+  `;
+
+    const result = await webR.evalR(rCode);
+    const jsResult = await result.toJs() as any;
+
+    const getValue = parseWebRResult(jsResult);
+
+    return {
+        kmo: (Array.isArray(getValue('kmo')) ? getValue('kmo')[0] : getValue('kmo')) || 0,
+        bartlettP: (Array.isArray(getValue('bartlett_p')) ? getValue('bartlett_p')[0] : getValue('bartlett_p')) || 1,
+        loadings: parseMatrix(getValue('loadings'), getValue('n_factors')?.[0] || 0),
+        communalities: getValue('communalities') || [],
+        structure: parseMatrix(getValue('structure'), getValue('n_factors')?.[0] || 0),
+        rCode
+    };
+}
+
+/**
+ * Data Validation Helper
+ */
+function validateData(data: number[][], minVars: number = 1, functionName: string = 'Analysis'): void {
+    if (!data || data.length === 0) {
+        throw new Error(`${functionName}: Dữ liệu trống`);
+    }
+
+    if (data[0].length < minVars) {
+        throw new Error(`${functionName}: Cần ít nhất ${minVars} biến`);
+    }
+
+    // Check for invalid values (NaN, Infinity)
+    const hasInvalid = data.some(row =>
+        row.some(val => !isFinite(val))
+    );
+
+    if (hasInvalid) {
+        throw new Error(`${functionName}: Dữ liệu chứa giá trị không hợp lệ(NaN hoặc Infinity)`);
+    }
+
+    // Check for constant columns (zero variance)
+    for (let col = 0; col < data[0].length; col++) {
+        const values = data.map(row => row[col]);
+        const allSame = values.every(v => v === values[0]);
+        if (allSame) {
+            throw new Error(`${functionName}: Biến thứ ${col + 1} có giá trị không đổi(variance = 0)`);
+        }
+    }
+}
+
+/**
+ * Run Multiple Linear Regression
+ * data: Matrix where first column is Dependent Variable (Y), others are Independent (X)
+ * names: Array of variable names corresponding to columns [Y, X1, X2...]
+ */
+export async function runLinearRegression(data: number[][], names: string[]): Promise<{
+    coefficients: {
+        term: string;
+        estimate: number;
+        stdError: number;
+        tValue: number;
+        pValue: number;
+        vif?: number; // Added VIF
+    }[];
+    modelFit: {
+        rSquared: number;
+        adjRSquared: number;
+        fStatistic: number;
+        df: number; // Num df
+        dfResid: number; // Denom df
+        pValue: number;
+        residualStdError: number;
+    };
+    equation: string;
+    chartData: {
+        fitted: number[];
+        residuals: number[];
+        actual: number[];
+    };
+    rCode: string;
+}> {
+    const webR = await initWebR();
+
+    // Sanitize names for R (remove spaces, special chars if needed) -> assume frontend handles or use simple mapping
+    // But R lm() works best with clean names.
+    const cleanNames = names.map(n => n.replace(/[^\w\d_]/g, '.')); // basic sanitization
+    // Actually, R formula with backticks handles spaces fine.
+
+    // Construct R command
+    const rCode = `
+data_mat <- ${arrayToRMatrix(data)}
+df <- as.data.frame(data_mat)
+    # Assign names
+colnames(df) <- c(${names.map(n => `"${n}"`).join(',')})
+    
+    # Formula: First col ~ . (all others)
+    # We must quote names in formula if they have special chars
+y_name <- colnames(df)[1]
+f_str <- paste(sprintf("\`%s\`", y_name), "~ .")
+f <- as.formula(f_str)
+
+model <- lm(f, data = df)
+s <- summary(model)
+    
+    # Extract Coefficients
+coefs <- coef(s)
+    
+    # Extract Model Fit
+fstat <- s$fstatistic
+    
+    # Calculate p - value for F - statistic
+    if (is.null(fstat)) {
+        f_val <- 0
+        df_num <- 0
+        df_denom <- 0
+        f_p_value <- 1
+    } else {
+        f_val <- fstat[1]
+        df_num <- fstat[2]
+        df_denom <- fstat[3]
+        f_p_value <- pf(f_val, df_num, df_denom, lower.tail = FALSE)
+    }
+
+list(
+    coef_names = rownames(coefs),
+    estimates = coefs[, 1],
+    std_errors = coefs[, 2],
+    t_values = coefs[, 3],
+    p_values = coefs[, 4],
+
+    r_squared = s$r.squared,
+    adj_r_squared = s$adj.r.squared,
+    f_stat = f_val,
+    df_num = df_num,
+    df_denom = df_denom,
+    f_p_value = f_p_value,
+    sigma = s$sigma,
+
+    fitted_values = fitted(model),
+    residuals = residuals(model),
+    actual_values = df[, 1]
+)
+    
+    # CALCULATE VIF(Manual method as car pkg might be missing)
+    # VIF_i = 1 / (1 - R_i ^ 2)
+vif_vals <- tryCatch({
+    x_data<- df[, -1, drop = FALSE] # Exclude dependent variable(col 1)
+       p <- ncol(x_data)
+       vifs <- numeric(p)
+       names(vifs) <- colnames(x_data)
+       
+       if (p > 1) {
+    for (i in 1:p) {
+             # Regress x[i] on other xs
+        r_model <- lm(x_data[, i] ~ ., data = x_data[, -i, drop = FALSE])
+        r2 <- summary(r_model)$r.squared
+        if (r2 >= 0.9999) {
+            vifs[i] <- 999.99 # Infinite / High
+        } else {
+            vifs[i] <- 1 / (1 - r2)
+        }
+    }
+} else {
+    vifs[1] <- 1.0
+}
+vifs
+    }, error = function (e) { return (numeric(0)) })
+    
+    # Append VIF to list
+res_list <- list(
+    coef_names = rownames(coefs),
+    estimates = coefs[, 1],
+    std_errors = coefs[, 2],
+    t_values = coefs[, 3],
+    p_values = coefs[, 4],
+
+    r_squared = s$r.squared,
+    adj_r_squared = s$adj.r.squared,
+    f_stat = f_val,
+    df_num = df_num,
+    df_denom = df_denom,
+    f_p_value = f_p_value,
+    sigma = s$sigma,
+
+    fitted_values = fitted(model),
+    residuals = residuals(model),
+    actual_values = df[, 1],
+
+    vifs = vif_vals
+)
+res_list
+    `;
+
+    const result = await webR.evalR(rCode);
+    const jsResult = await result.toJs() as any;
+
+    const getValue = parseWebRResult(jsResult);
+    const coefNames = getValue('coef_names') || [];
+    const estimates = getValue('estimates') || [];
+    const stdErrors = getValue('std_errors') || [];
+    const tValues = getValue('t_values') || [];
+    const pValues = getValue('p_values') || [];
+    const vifs = getValue('vifs') || []; // Get VIFs
+
+    // Extract Chart Data
+    const fittedValues = getValue('fitted_values') || [];
+    const residuals = getValue('residuals') || [];
+    const actualValues = getValue('actual_values') || [];
+
+    const coefficients = [];
+    const len = coefNames.length;
+
+    // Find intercept
+    let interceptVal = 0;
+    const interceptIndex = coefNames.findIndex(n => n === '(Intercept)');
+    if (interceptIndex !== -1) {
+        interceptVal = estimates[interceptIndex];
+    }
+
+    for (let i = 0; i < len; i++) {
+        // Skip adding Intercept to coefficients list if we want to separate it, 
+        // but typically we list all. VIF handling handles skip.
+        // Actually, let's keep all in list.
+        coefficients.push({
+            term: coefNames[i],
+            estimate: estimates[i],
+            stdError: stdErrors[i],
+            tValue: tValues[i],
+            pValue: pValues[i],
+            vif: (coefNames[i] !== '(Intercept)') ? (vifs[(i - 1)] || undefined) : undefined
+        });
+    }
+
+    // Build Equation
+    let equationStr = `${interceptVal.toFixed(3)}`;
+
+    for (const coef of coefficients) {
+        if (coef.term === '(Intercept)') continue;
+        const val = coef.estimate;
+        const sign = val >= 0 ? ' + ' : ' - ';
+        const cleanTerm = coef.term.replace(/`/g, '');
+        equationStr += `${sign}${Math.abs(val).toFixed(3)}*${cleanTerm}`;
+    }
+
+    const fitMeasures = {
+        rSquared: (Array.isArray(getValue('r_squared')) ? getValue('r_squared')[0] : getValue('r_squared')) || 0,
+        adjRSquared: (Array.isArray(getValue('adj_r_squared')) ? getValue('adj_r_squared')[0] : getValue('adj_r_squared')) || 0,
+        fStatistic: (Array.isArray(getValue('f_stat')) ? getValue('f_stat')[0] : getValue('f_stat')) || 0,
+        df: (Array.isArray(getValue('df_num')) ? getValue('df_num')[0] : getValue('df_num')) || 0,
+        dfResid: (Array.isArray(getValue('df_denom')) ? getValue('df_denom')[0] : getValue('df_denom')) || 0,
+        pValue: (Array.isArray(getValue('f_p_value')) ? getValue('f_p_value')[0] : getValue('f_p_value')) || 0,
+        residualStdError: (Array.isArray(getValue('sigma')) ? getValue('sigma')[0] : getValue('sigma')) || 0,
+    };
+
+    return {
+        coefficients,
+        modelFit: fitMeasures,
+        equation: equationStr,
+        chartData: {
+            fitted: fittedValues,
+            residuals: residuals,
+            actual: actualValues
+        },
+        rCode: rCode
+    };
+}
+
+/**
+ * Run Mann-Whitney U Test (Non-parametric Independent T-test)
+ * Data expects 2 columns: [Group, Value]
+ */
+export async function runMannWhitneyU(data: number[][]): Promise<{
+    statistic: number;
+    pValue: number;
+    method: string;
+    groupStats: any;
+    rCode: string;
+}> {
+    const webR = await initWebR();
+    const rCode = `
+    data_mat <- ${arrayToRMatrix(data)}
+    df <- as.data.frame(data_mat)
+    colnames(df) <- c('group', 'value')
+    
+    # Ensure group is factor
+    df$group <- as.factor(df$group)
+    
+    # Check groups
+    if (length(levels(df$group)) != 2) {
+        stop("Mann-Whitney U requires exactly 2 groups")
+    }
+    
+    # Test
+    test <- wilcox.test(value ~ group, data = df)
+    
+    # Simple descriptive stats by group
+    means <- aggregate(value ~ group, data = df, median)
+    
+    list(
+        statistic = test$statistic,
+        p_value = test$p.value,
+        method = test$method,
+        groups = as.character(means[,1]),
+        medians = means[,2]
+    )
+    `;
+
+    const result = await webR.evalR(rCode);
+    const jsResult = await result.toJs() as any;
+    const getValue = parseWebRResult(jsResult);
+
+    return {
+        statistic: (Array.isArray(getValue('statistic')) ? getValue('statistic')[0] : getValue('statistic')) || 0,
+        pValue: (Array.isArray(getValue('p_value')) ? getValue('p_value')[0] : getValue('p_value')) || 0,
+        method: (Array.isArray(getValue('method')) ? getValue('method')[0] : getValue('method')) || 'Mann-Whitney U Test',
+        groupStats: {
+            groups: getValue('groups') || [],
+            medians: getValue('medians') || []
+        },
+        rCode: rCode
+    };
+}
+
+/**
+ * Run Chi-Square Test of Independence
+ * Data expects 2 columns: [Var1, Var2]
+ */
+export async function runChiSquare(data: number[][]): Promise<{
+    statistic: number;
+    df: number;
+    pValue: number;
+    observed: any;
+    expected: any;
+    rCode: string;
+}> {
+    const webR = await initWebR();
+    const rCode = `
+    data_mat <- ${arrayToRMatrix(data)}
+    # Convert to table
+    tbl <- table(data_mat[,1], data_mat[,2])
+    
+    test <- chisq.test(tbl)
+    
+    list(
+        statistic = test$statistic,
+        parameter = test$parameter,
+        p_value = test$p.value,
+        
+        # Capture Observed and Expected matrices flattened or carefully structured
+        # For simplicity, let's keep them as R handles and parse carefully, 
+        # but flattening is safer for transfer
+        obs_vals = as.numeric(test$observed),
+        exp_vals = as.numeric(test$expected),
+        
+        row_names = rownames(tbl),
+        col_names = colnames(tbl),
+        
+        n_rows = nrow(tbl),
+        n_cols = ncol(tbl)
+    )
+    `;
+
+    const result = await webR.evalR(rCode);
+    const jsResult = await result.toJs() as any;
+    const getValue = parseWebRResult(jsResult);
+
+    const nRows = getValue('n_rows')?.[0] || 0;
+    const nCols = getValue('n_cols')?.[0] || 0;
+    const obsVals = getValue('obs_vals') || [];
+    const expVals = getValue('exp_vals') || [];
+    const rowNames = getValue('row_names') || [];
+    const colNames = getValue('col_names') || [];
+
+    // Reconstruct matrices
+    // R fills by column by default when flattening, but here we used as.numeric on the table/matrix
+    // table objects are vector-like, column-major.
+    const observed = [];
+    const expected = [];
+
+    for (let r = 0; r < nRows; r++) {
+        const rowObs = [];
+        const rowExp = [];
+        for (let c = 0; c < nCols; c++) {
+            // Index for column-major: r + c * nRows
+            const idx = r + c * nRows;
+            rowObs.push(obsVals[idx]);
+            rowExp.push(expVals[idx]);
+        }
+        observed.push(rowObs);
+        expected.push(rowExp);
+    }
+
+    return {
+        statistic: (Array.isArray(getValue('statistic')) ? getValue('statistic')[0] : getValue('statistic')) || 0,
+        df: (Array.isArray(getValue('parameter')) ? getValue('parameter')[0] : getValue('parameter')) || 0,
+        pValue: (Array.isArray(getValue('p_value')) ? getValue('p_value')[0] : getValue('p_value')) || 0,
+        observed: {
+            data: observed,
+            rows: rowNames,
+            cols: colNames
+        },
+        expected: {
+            data: expected,
+            rows: rowNames,
+            cols: colNames
+        },
+        rCode: rCode
+    };
+}
+
+/**
+ * Run Confirmatory Factor Analysis (CFA) using lavaan
+ */
+export async function runCFA(
+    data: number[][],
+    columns: string[],
+    modelSyntax: string
+): Promise<{
+    fitMeasures: {
+        cfi: number;
+        tli: number;
+        rmsea: number;
+        srmr: number;
+        chisq: number;
+        df: number;
+        pvalue: number;
+    };
+    estimates: {
+        lhs: string;
+        op: string;
+        rhs: string;
+        est: number;
+        std: number;
+        pvalue: number;
+        se: number;
+    }[];
+    rCode: string;
+}> {
+    const webR = await initWebR();
+
+    // Sanitize column names for R (lavaan hates spaces/special chars)
+    // We will use strict mapping: col_1, col_2, etc. internally if needed, 
+    // but here we assume user provides clean names or we quote them.
+    // Lavaan syntax: `F1 =~ x1 + x2`
+
+    // NOTE: Lavaan package might need to be installed if not present in default WebR image.
+    // But psych is there. lavaan is popular, might be there.
+    // If not, we need `install.packages('lavaan')` which takes time and network.
+    // We add a check.
+
+    const rCode = `
+    if (!requireNamespace("lavaan", quietly = TRUE)) {
+      install.packages("lavaan", repos="https://repo.r-wasm.org/")
+    }
+    library(lavaan)
+    
+    # 1. Prepare Data
+    data_mat <- ${arrayToRMatrix(data)}
+    df <- as.data.frame(data_mat)
+    colnames(df) <- c(${columns.map(c => `"${c}"`).join(',')})
+    
+    # 2. Model Syntax
+    model <- "${modelSyntax}"
+    
+    # 3. Run CFA
+    # std.lv = TRUE fixes scale by setting factor variance to 1
+    # missing = "fiml" handles missing data using Full Information Maximum Likelihood
+    fit <- cfa(model, data=df, std.lv=TRUE, missing="fiml") 
+    
+    # 4. Extract Fit Measures
+    fits <- fitMeasures(fit, c("cfi", "tli", "rmsea", "srmr", "chisq", "df", "pvalue"))
+    
+    # 5. Extract Parameter Estimates
+    ests <- parameterEstimates(fit, standardized=TRUE)
+    
+    # Filter only useful parts (loadings =~, regressions ~, covariances ~~)
+    # We convert to a simpler list structure for JSON
+    
+    list(
+      cfi = as.numeric(fits["cfi"]),
+      tli = as.numeric(fits["tli"]),
+      rmsea = as.numeric(fits["rmsea"]),
+      srmr = as.numeric(fits["srmr"]),
+      chisq = as.numeric(fits["chisq"]),
+      df = as.numeric(fits["df"]),
+      pvalue = as.numeric(fits["pvalue"]),
+      
+      # Estimates vectors
+      lhs = ests$lhs,
+      op = ests$op,
+      rhs = ests$rhs,
+      est = ests$est,
+      std = ests$std.all,
+      se = ests$se,
+      p = ests$pvalue,
+      
+      n_ests = nrow(ests)
+    )
+    `;
+
+    try {
+        const result = await webR.evalR(rCode);
+        const jsResult = await result.toJs() as any;
+        const getValue = parseWebRResult(jsResult);
+
+        const fitMeasures = {
+            cfi: (Array.isArray(getValue('cfi')) ? getValue('cfi')[0] : getValue('cfi')) || 0,
+            tli: (Array.isArray(getValue('tli')) ? getValue('tli')[0] : getValue('tli')) || 0,
+            rmsea: (Array.isArray(getValue('rmsea')) ? getValue('rmsea')[0] : getValue('rmsea')) || 0,
+            srmr: (Array.isArray(getValue('srmr')) ? getValue('srmr')[0] : getValue('srmr')) || 0,
+            chisq: (Array.isArray(getValue('chisq')) ? getValue('chisq')[0] : getValue('chisq')) || 0,
+            df: (Array.isArray(getValue('df')) ? getValue('df')[0] : getValue('df')) || 0,
+            pvalue: (Array.isArray(getValue('pvalue')) ? getValue('pvalue')[0] : getValue('pvalue')) || 0,
+        };
+
+        // Parse Estimates
+        const nEsts = getValue('n_ests')?.[0] || 0;
+        const estimates = [];
+
+        const lhs = getValue('lhs') || [];
+        const op = getValue('op') || [];
+        const rhs = getValue('rhs') || [];
+        const est = getValue('est') || [];
+        const std = getValue('std') || [];
+        const se = getValue('se') || [];
+        const p = getValue('p') || [];
+
+        for (let i = 0; i < nEsts; i++) {
+            estimates.push({
+                lhs: lhs[i],
+                op: op[i],
+                rhs: rhs[i],
+                est: est[i],
+                std: std[i],
+                se: se[i],
+                pvalue: p[i]
+            });
+        }
+
+        return { fitMeasures, estimates, rCode };
+
+    } catch (e: any) {
+        throw new Error("Lavaan Error: " + e.message);
+    }
+}
+
+/**
+ * Run Structural Equation Modeling (SEM) using lavaan
+ */
+export async function runSEM(
+    data: number[][],
+    columns: string[],
+    modelSyntax: string
+): Promise<{
+    fitMeasures: {
+        cfi: number;
+        tli: number;
+        rmsea: number;
+        srmr: number;
+        chisq: number;
+        df: number;
+        pvalue: number;
+    };
+    estimates: {
+        lhs: string;
+        op: string;
+        rhs: string;
+        est: number;
+        std: number;
+        pvalue: number;
+        se: number;
+    }[];
+    rCode: string;
+}> {
+    const webR = await initWebR();
+
+    // Check for lavaan
+    const rCode = `
+    if (!requireNamespace("lavaan", quietly = TRUE)) {
+      install.packages("lavaan", repos="https://repo.r-wasm.org/")
+    }
+    library(lavaan)
+    
+    # 1. Prepare Data
+    data_mat <- ${arrayToRMatrix(data)}
+    df <- as.data.frame(data_mat)
+    colnames(df) <- c(${columns.map(c => `"${c}"`).join(',')})
+    
+    # 2. Model Syntax
+    model <- "${modelSyntax}"
+    
+    # 3. Run SEM
+    # std.lv = TRUE fixes scale by setting factor variance to 1
+    # sem() function is used for structural models
+    fit <- sem(model, data=df, std.lv=TRUE, missing="fiml")
+    
+    # 4. Extract Fit Measures
+    fits <- fitMeasures(fit, c("cfi", "tli", "rmsea", "srmr", "chisq", "df", "pvalue"))
+    
+    # 5. Extract Parameter Estimates
+    ests <- parameterEstimates(fit, standardized=TRUE)
+    
+    list(
+      cfi = as.numeric(fits["cfi"]),
+      tli = as.numeric(fits["tli"]),
+      rmsea = as.numeric(fits["rmsea"]),
+      srmr = as.numeric(fits["srmr"]),
+      chisq = as.numeric(fits["chisq"]),
+      df = as.numeric(fits["df"]),
+      pvalue = as.numeric(fits["pvalue"]),
+      
+      # Estimates vectors
+      lhs = ests$lhs,
+      op = ests$op,
+      rhs = ests$rhs,
+      est = ests$est,
+      std = ests$std.all,
+      se = ests$se,
+      p = ests$pvalue,
+      
+      n_ests = nrow(ests)
+    )
+    `;
+
+    try {
+        const result = await webR.evalR(rCode);
+        const jsResult = await result.toJs() as any;
+        const getValue = parseWebRResult(jsResult);
+
+        // Reuse parsing logic similar to CFA
+        const fitMeasures = {
+            cfi: getValue('cfi')?.[0] || 0,
+            tli: getValue('tli')?.[0] || 0,
+            rmsea: getValue('rmsea')?.[0] || 0,
+            srmr: getValue('srmr')?.[0] || 0,
+            chisq: getValue('chisq')?.[0] || 0,
+            df: getValue('df')?.[0] || 0,
+            pvalue: getValue('pvalue')?.[0] || 0,
+        };
+
+        const nEsts = getValue('n_ests')?.[0] || 0;
+        const estimates = [];
+
+        const lhs = getValue('lhs') || [];
+        const op = getValue('op') || [];
+        const rhs = getValue('rhs') || [];
+        const est = getValue('est') || [];
+        const std = getValue('std') || [];
+        const se = getValue('se') || [];
+        const p = getValue('p') || [];
+
+        for (let i = 0; i < nEsts; i++) {
+            estimates.push({
+                lhs: lhs[i],
+                op: op[i],
+                rhs: rhs[i],
+                est: est[i],
+                std: std[i],
+                se: se[i],
+                pvalue: p[i]
+            });
+        }
+
+        return { fitMeasures, estimates, rCode };
+
+    } catch (e: any) {
+        throw new Error("Lavaan SEM Error: " + e.message);
+    }
+}
